@@ -8,42 +8,50 @@ import {BasenameUtils} from "./lib/BasenameUtils.sol";
 
 /**
  * @title BasenameRegistrar
- * @notice Abstract contract that enables any smart contract to easily register
- *         and manage its own Basename (primary name on Base)
- * @dev Inherit from this contract to gain basename registration capabilities.
+ * @notice Abstract contract that enables any smart contract to register and manage
+ *         its own Basename (name.base.eth) on Base.
  *
- *      IMPORTANT: The inheriting contract must be able to receive ETH or have
- *      sufficient balance when calling registration functions.
+ * @dev Inherit from this contract, then expose public wrappers protected by your
+ *      own access control (e.g. onlyOwner). Example:
  *
- *      Mainnet addresses are hardcoded. Use the constructor for testnets.
+ *      function registerBasename(string memory name, uint256 duration)
+ *          external payable onlyOwner
+ *      {
+ *          _registerBasename(name, duration);
+ *          _setForwardResolution(name);   // sets name.base.eth → address(this)
+ *      }
+ *
+ *      After registration both directions are set:
+ *        address(this) → name.base.eth   (reverse — set during registration)
+ *        name.base.eth → address(this)   (forward — set by _setForwardResolution)
+ *
+ *      Rescue: if a contract already owns a name but the forward record is wrong,
+ *      call _setForwardResolution(name) at any time to correct it.
  */
 abstract contract BasenameRegistrar {
-    using BasenameUtils for string;
 
     // =============================================================
     //                           EVENTS
     // =============================================================
 
-    /**
-     * @notice Emitted when a basename is successfully registered for this contract
-     */
+    /// @notice Emitted when a basename is successfully registered.
     event BasenameRegistered(
         string indexed name,
         address indexed contractAddress,
         uint256 duration
     );
 
-    /**
-     * @notice Emitted when the primary basename is set/reset for this contract
-     */
+    /// @notice Emitted when the primary (reverse) name is set or updated.
     event PrimaryBasenameSet(string indexed name, address indexed contractAddress);
+
+    /// @notice Emitted when the forward addr record is set on the resolver.
+    event ForwardResolutionSet(string indexed name, address indexed contractAddress);
 
     // =============================================================
     //                           ERRORS
     // =============================================================
 
     error InsufficientETH(uint256 required, uint256 provided);
-    error RegistrationFailed();
     error InvalidDuration();
     error EmptyName();
 
@@ -51,28 +59,28 @@ abstract contract BasenameRegistrar {
     //                           CONSTANTS
     // =============================================================
 
-    /// @notice RegistrarController on Base mainnet
-    /// @dev This is the UpgradeableRegistrarController (proxy) — the original
-    ///      RegistrarController (0x4cCb...) is no longer approved by BaseRegistrar.
+    /// @notice UpgradeableRegistrarController proxy — the active registration
+    ///         contract on Base mainnet (0x4cCb... is deprecated and no longer
+    ///         approved by BaseRegistrar).
     address public constant REGISTRAR_CONTROLLER =
         0xa7d2607c6BD39Ae9521e514026CBB078405Ab322;
 
-    /// @notice ReverseRegistrar on Base mainnet
+    /// @notice ReverseRegistrar on Base mainnet.
     address public constant REVERSE_REGISTRAR =
         0x79EA96012eEa67A83431F1701B3dFf7e37F9E282;
 
-    /// @notice L2Resolver on Base mainnet
+    /// @notice L2Resolver on Base mainnet.
     address public constant L2_RESOLVER =
         0xC6d566A56A1aFf6508b41f6c90ff131615583BCD;
 
-    /// @notice Minimum registration duration (365 days)
+    /// @notice Minimum registration duration (365 days).
     uint256 public constant MIN_REGISTRATION_DURATION = 365 days;
 
     // =============================================================
     //                           STORAGE
     // =============================================================
 
-    /// @notice Allows overriding addresses for testing / testnets
+    /// @dev Set to true when testnet addresses are provided in the constructor.
     bool internal _useCustomAddresses;
     address internal _customRegistrarController;
     address internal _customReverseRegistrar;
@@ -83,8 +91,8 @@ abstract contract BasenameRegistrar {
     // =============================================================
 
     /**
-     * @notice Constructor for custom network configuration (mainly for testing)
-     * @dev Leave empty to use mainnet constants. Only set if deploying on testnet.
+     * @notice Pass (address(0), address(0), address(0)) for Base mainnet.
+     *         Pass actual addresses to override for testnets.
      */
     constructor(
         address registrarController_,
@@ -104,51 +112,34 @@ abstract contract BasenameRegistrar {
     }
 
     // =============================================================
-    //                           REGISTRATION
+    //                    REGISTRATION & RESOLUTION
     // =============================================================
 
     /**
-     * @notice Internal function to register a new basename for this contract
-     * @dev The contract will own the name and set itself as the primary name.
-     *      Sends any excess ETH back to the caller.
-     * @param name The label to register (e.g. "mycontract" → mycontract.base.eth)
-     * @param duration Registration duration in seconds (minimum 365 days)
+     * @notice Register a new basename and set the reverse (primary) name.
+     * @dev Does NOT set forward resolution automatically — call _setForwardResolution
+     *      immediately after to complete both directions. Refunds excess ETH.
+     * @param name     The label to register, e.g. "myapp" → myapp.base.eth
+     * @param duration Seconds to register for (minimum MIN_REGISTRATION_DURATION)
      */
-    function _registerBasename(
-        string memory name,
-        uint256 duration
-    ) internal {
+    function _registerBasename(string memory name, uint256 duration) internal {
         if (bytes(name).length == 0) revert EmptyName();
         if (duration < MIN_REGISTRATION_DURATION) revert InvalidDuration();
 
-        IRegistrarController controller = IRegistrarController(
-            _getRegistrarController()
-        );
-        IReverseRegistrar reverseRegistrar = IReverseRegistrar(
-            _getReverseRegistrar()
-        );
-        IL2Resolver resolver = IL2Resolver(_getL2Resolver());
+        IRegistrarController controller = IRegistrarController(_getRegistrarController());
 
-        // Get price
-        IRegistrarController.Price memory price = controller.rentPrice(
-            name,
-            duration
-        );
+        // Price check
+        IRegistrarController.Price memory price = controller.rentPrice(name, duration);
         uint256 totalPrice = price.base + price.premium;
-
         if (address(this).balance < totalPrice) {
             revert InsufficientETH(totalPrice, address(this).balance);
         }
 
-        // Register with empty data[] — the L2Resolver only allows the
-        // RegistrarController (stored in its registrarController slot) to call
-        // setAddr during registration. Since the active controller address may
-        // differ from what's stored in the resolver, we skip the setAddr multicall
-        // here and rely on reverseRecord=true for the primary (reverse) name.
-        // Forward resolution (name → address) can be set separately by the owner
-        // via the L2Resolver after registration.
+        // Build request. data[] is intentionally empty: the L2Resolver's setAddr
+        // is gated to the address stored in resolver.registrarController, which
+        // differs from the active controller. Setting addr separately via
+        // _setForwardResolution() avoids that restriction entirely.
         bytes[] memory data = new bytes[](0);
-
         uint256[] memory coinTypes = new uint256[](0);
 
         IRegistrarController.RegisterRequest memory request = IRegistrarController
@@ -158,47 +149,56 @@ abstract contract BasenameRegistrar {
                 duration: duration,
                 resolver: _getL2Resolver(),
                 data: data,
-                reverseRecord: true, // Sets primary (reverse) name: address → name
-                coinTypes: coinTypes, // No extra coin type resolution
-                referralExpiry: 0,   // No referral
-                referralData: ""     // No referral data
+                reverseRecord: true,   // sets address(this) → name.base.eth
+                coinTypes: coinTypes,
+                referralExpiry: 0,
+                referralData: ""
             });
 
-        // Execute registration
         controller.register{value: totalPrice}(request);
 
-        // Refund any excess ETH
+        // Refund excess ETH to caller
         uint256 remaining = address(this).balance;
         if (remaining > 0) {
-            (bool success, ) = msg.sender.call{value: remaining}("");
-            // We don't revert on refund failure to not break registration
-            success; // silence warning
+            (bool ok, ) = msg.sender.call{value: remaining}("");
+            ok; // non-reverting refund
         }
 
         emit BasenameRegistered(name, address(this), duration);
     }
 
     /**
-     * @notice Sets or updates the primary basename for this contract
-     * @dev Use this when the name is already registered but you want to set/re-set primary
-     * @param name The full name including .base.eth or just the label
+     * @notice Set the forward addr record: name.base.eth → address(this).
+     * @dev Call this right after _registerBasename to complete both directions.
+     *      Also works as a rescue function: if a contract already owns a name but
+     *      the forward addr record is wrong or missing, call this to fix it.
+     *      The contract must own the name (be the registry node owner) for this
+     *      to be authorised by the resolver.
+     * @param name The label (e.g. "myapp" for myapp.base.eth)
+     */
+    function _setForwardResolution(string memory name) internal {
+        if (bytes(name).length == 0) revert EmptyName();
+        bytes32 node = BasenameUtils.basenameNode(name);
+        // setAddr(bytes32 node, address a) sets coinType 60 (ETH) addr record.
+        // Authorised because address(this) is the registry owner of the node.
+        IL2Resolver(_getL2Resolver()).setAddr(node, address(this));
+        emit ForwardResolutionSet(name, address(this));
+    }
+
+    /**
+     * @notice Set or update the primary (reverse) name for this contract.
+     * @dev Use when the name is already registered but you want to update the
+     *      reverse record — e.g. after transferring a name to this contract.
+     * @param name The label or full name (e.g. "myapp" or "myapp.base.eth")
      */
     function _setPrimaryBasename(string memory name) internal {
         if (bytes(name).length == 0) revert EmptyName();
 
-        // Normalize: if user passed just label, append .base.eth
-        string memory fullName = name;
-        if (!_endsWithBaseEth(name)) {
-            fullName = string(abi.encodePacked(name, ".base.eth"));
-        }
+        string memory fullName = _endsWithBaseEth(name)
+            ? name
+            : string(abi.encodePacked(name, ".base.eth"));
 
-        IReverseRegistrar reverseRegistrar = IReverseRegistrar(
-            _getReverseRegistrar()
-        );
-
-        // Calling setName from this contract sets the reverse record for address(this)
-        reverseRegistrar.setName(fullName);
-
+        IReverseRegistrar(_getReverseRegistrar()).setName(fullName);
         emit PrimaryBasenameSet(name, address(this));
     }
 
@@ -207,51 +207,37 @@ abstract contract BasenameRegistrar {
     // =============================================================
 
     /**
-     * @notice Returns the total cost to register a name for a given duration
+     * @notice Returns the total cost in wei to register a name for a given duration.
      */
     function getBasenamePrice(
         string memory name,
         uint256 duration
     ) public view returns (uint256) {
-        IRegistrarController controller = IRegistrarController(
-            _getRegistrarController()
-        );
-        IRegistrarController.Price memory price = controller.rentPrice(
-            name,
-            duration
-        );
+        IRegistrarController controller = IRegistrarController(_getRegistrarController());
+        IRegistrarController.Price memory price = controller.rentPrice(name, duration);
         return price.base + price.premium;
     }
 
     // =============================================================
-    //                           INTERNAL HELPERS
+    //                       INTERNAL HELPERS
     // =============================================================
 
     function _getRegistrarController() internal view returns (address) {
-        return
-            _useCustomAddresses
-                ? _customRegistrarController
-                : REGISTRAR_CONTROLLER;
+        return _useCustomAddresses ? _customRegistrarController : REGISTRAR_CONTROLLER;
     }
 
     function _getReverseRegistrar() internal view returns (address) {
-        return
-            _useCustomAddresses
-                ? _customReverseRegistrar
-                : REVERSE_REGISTRAR;
+        return _useCustomAddresses ? _customReverseRegistrar : REVERSE_REGISTRAR;
     }
 
     function _getL2Resolver() internal view returns (address) {
         return _useCustomAddresses ? _customL2Resolver : L2_RESOLVER;
     }
 
-    function _endsWithBaseEth(
-        string memory str
-    ) internal pure returns (bool) {
+    function _endsWithBaseEth(string memory str) internal pure returns (bool) {
         bytes memory b = bytes(str);
         bytes memory suffix = bytes(".base.eth");
         if (b.length < suffix.length) return false;
-
         for (uint256 i = 0; i < suffix.length; i++) {
             if (b[b.length - suffix.length + i] != suffix[i]) return false;
         }
@@ -262,8 +248,5 @@ abstract contract BasenameRegistrar {
     //                           RECEIVE
     // =============================================================
 
-    /**
-     * @notice Allows the contract to receive ETH for registration payments
-     */
     receive() external payable virtual {}
 }
