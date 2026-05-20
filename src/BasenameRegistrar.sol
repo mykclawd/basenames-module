@@ -128,17 +128,19 @@ abstract contract BasenameRegistrar {
 
         IRegistrarController controller = IRegistrarController(_getRegistrarController());
 
-        // Price check
+        // Get the price and forward the exact amount to the registrar.
+        // We intentionally do NOT check address(this).balance here — doing so
+        // causes eth_estimateGas to revert when the contract has no pre-existing
+        // balance, which gives MetaMask a wrong gas limit and shows "likely to fail".
+        // Instead we forward msg.value directly; if it's insufficient the registrar
+        // will revert with its own InsufficientValue() error.
         IRegistrarController.Price memory price = controller.rentPrice(name, duration);
         uint256 totalPrice = price.base + price.premium;
-        if (address(this).balance < totalPrice) {
-            revert InsufficientETH(totalPrice, address(this).balance);
-        }
 
         // Build request. data[] is intentionally empty: the L2Resolver's setAddr
         // is gated to the address stored in resolver.registrarController, which
-        // differs from the active controller. Setting addr separately via
-        // _setForwardResolution() avoids that restriction entirely.
+        // may differ from the active controller. Set forward resolution separately
+        // via _setForwardResolution() after this call.
         bytes[] memory data = new bytes[](0);
         uint256[] memory coinTypes = new uint256[](0);
 
@@ -157,11 +159,11 @@ abstract contract BasenameRegistrar {
 
         controller.register{value: totalPrice}(request);
 
-        // Refund excess ETH to caller
-        uint256 remaining = address(this).balance;
-        if (remaining > 0) {
-            (bool ok, ) = msg.sender.call{value: remaining}("");
-            ok; // non-reverting refund
+        // Refund any excess ETH to the caller
+        uint256 excess = address(this).balance;
+        if (excess > 0) {
+            (bool ok, ) = msg.sender.call{value: excess}("");
+            ok; // non-reverting — registration already succeeded
         }
 
         emit BasenameRegistered(name, address(this), duration);
