@@ -8,7 +8,8 @@ pragma solidity ^0.8.23;
  */
 library BasenameUtils {
     /// @notice The namehash of "base.eth"
-    bytes32 public constant BASE_ETH_NODE = 0xff1e3c0eb00ec714e2b7139c290c28ae5c1e7069d6d3cf41567aa5806d24a58c;
+    /// @dev Computed as: keccak256(keccak256(0x0...0, keccak256("eth")), keccak256("base"))
+    bytes32 public constant BASE_ETH_NODE = 0xff1e3c0eb00ec714e34b6114125fbde1dea2f24a72fbf672e7b7fd5690328e10;
 
     /**
      * @notice Computes the ENS namehash of a fully qualified name
