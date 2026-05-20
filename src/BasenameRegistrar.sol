@@ -128,18 +128,19 @@ abstract contract BasenameRegistrar {
 
         IRegistrarController controller = IRegistrarController(_getRegistrarController());
 
-        // Get the price and forward the exact amount to the registrar.
-        // We intentionally do NOT check address(this).balance here — doing so
-        // causes eth_estimateGas to revert when the contract has no pre-existing
-        // balance, which gives MetaMask a wrong gas limit and shows "likely to fail".
-        // Instead we forward msg.value directly; if it's insufficient the registrar
-        // will revert with its own InsufficientValue() error.
+        // Determine price.
+        // We check msg.value (not address(this).balance) for two reasons:
+        // 1. Checking address(this).balance causes eth_estimateGas to revert on a
+        //    zero-balance contract, giving wallets a wrong gas limit.
+        // 2. Only ETH sent with THIS call should fund the registration — the contract
+        //    may hold ETH for other purposes (treasury) that must not be touched.
         IRegistrarController.Price memory price = controller.rentPrice(name, duration);
         uint256 totalPrice = price.base + price.premium;
+        if (msg.value < totalPrice) revert InsufficientETH(totalPrice, msg.value);
 
         // Build request. data[] is intentionally empty: the L2Resolver's setAddr
         // is gated to the address stored in resolver.registrarController, which
-        // may differ from the active controller. Set forward resolution separately
+        // differs from the active controller. Set forward resolution separately
         // via _setForwardResolution() after this call.
         bytes[] memory data = new bytes[](0);
         uint256[] memory coinTypes = new uint256[](0);
@@ -159,8 +160,10 @@ abstract contract BasenameRegistrar {
 
         controller.register{value: totalPrice}(request);
 
-        // Refund any excess ETH to the caller
-        uint256 excess = address(this).balance;
+        // Refund only the excess from THIS call's msg.value — not the contract's
+        // total balance, which may include funds held for other purposes.
+        // excess = what was sent in - what the registrar charged
+        uint256 excess = msg.value - totalPrice;
         if (excess > 0) {
             (bool ok, ) = msg.sender.call{value: excess}("");
             ok; // non-reverting — registration already succeeded
