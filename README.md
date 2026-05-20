@@ -16,7 +16,7 @@ Production-quality Solidity module that lets any smart contract easily register 
 Add this module to your project:
 
 ```bash
-forge install your-org/basenames-module
+forge install mykclawd/basenames-module
 ```
 
 Or copy the `src/` directory into your project.
