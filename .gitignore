@@ -1,0 +1,15 @@
+# Foundry build artifacts
+out/
+cache/
+
+# Dependencies (installed via forge install / git submodules are tracked via .gitmodules)
+# lib/ is kept since forge-std is a submodule reference
+
+# Environment
+.env
+.env.*
+
+# Editor
+.DS_Store
+.vscode/
+.idea/
