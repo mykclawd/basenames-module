@@ -4,9 +4,12 @@ A Solidity abstract contract that lets any smart contract register and own a pri
 
 ## Live Example
 
-[`numbercounter.base.eth`](https://www.base.org/name/numbercounter) → [`0x8e8d7bb8Ad939CaBA20dCA419A633CEb9263F36f`](https://basescan.org/address/0x8e8d7bb8ad939caba20dca419a633ceb9263f36f)
+[`incrementer.base.eth`](https://www.base.org/name/incrementer) → [`0x2287ECB162bC14d69f336541cEEfFf738f57d676`](https://basescan.org/address/0x2287ecb162bc14d69f336541ceefff738f57d676)
 
-A public counter contract on Base that inherited this module and registered `numbercounter.base.eth`. Anyone can increment the counter; only the owner can manage its basename.
+A public counter contract on Base that inherited this module. myk.eth registered `incrementer.base.eth` — and both forward and reverse resolution work:
+
+![incrementer.base.eth resolves correctly](./incrementer-demo.jpg)
+
 Source: [mykclawd/basename-counter](https://github.com/mykclawd/basename-counter)
 
 ---
@@ -44,7 +47,7 @@ contract MyContract is BasenameRegistrar, Ownable {
         _registerBasename(name, duration);
     }
 
-    /// @notice Step 2: Set the forward addr record (no ETH needed).
+    /// @notice Step 2: Set the forward addr record (no ETH needed, separate tx).
     function setForwardResolution(string memory name) external onlyOwner {
         _setForwardResolution(name);
     }
@@ -59,7 +62,7 @@ cast call <YOUR_CONTRACT> \
   "getBasenamePrice(string,uint256)(uint256)" "myapp" "31536000" \
   --rpc-url https://mainnet.base.org
 
-# Step 1: Register (send slightly more than price — excess is refunded)
+# Step 1: Register (payable — send ETH; excess is refunded automatically)
 cast send <YOUR_CONTRACT> \
   "registerBasename(string,uint256)" "myapp" "31536000" \
   --value 0.001ether \
@@ -75,20 +78,20 @@ cast send <YOUR_CONTRACT> \
 
 ### 3. What you get after both steps
 
-- `myapp.base.eth` → your contract address ✅ (forward — set by `setForwardResolution`)
-- your contract address → `myapp.base.eth` ✅ (reverse — set during registration)
+- `myapp.base.eth` → your contract address ✅ (forward)
+- your contract address → `myapp.base.eth` ✅ (reverse / primary name)
 
 ---
 
 ## Why two transactions?
 
-Combining registration and the forward addr write in one transaction causes wallet gas estimators (MetaMask etc.) to under-estimate gas and show "likely to fail." Splitting them keeps each transaction simple and gas-estimable.
+Combining registration and the forward addr write in one transaction causes wallet gas estimators (MetaMask etc.) to under-estimate gas and show "likely to fail." Splitting keeps each transaction simple and gas-estimable — no manual gas limit required.
 
 ---
 
 ## Rescue: fixing stale forward resolution
 
-If you already own a name but the forward addr record is wrong or missing (e.g. it was registered before this module was updated), just call `_setForwardResolution` at any time:
+If a contract already owns a name but the forward addr record is wrong or missing, call `_setForwardResolution` at any time to fix it:
 
 ```solidity
 function fixForwardResolution(string memory name) external onlyOwner {
@@ -109,9 +112,9 @@ function fixForwardResolution(string memory name) external onlyOwner {
 
 ---
 
-## Real-world example: Counter contract
+## Full example: Counter contract
 
-[`numbercounter.base.eth`](https://www.base.org/name/numbercounter) is a live demonstration at [`0x8e8d7bb8Ad939CaBA20dCA419A633CEb9263F36f`](https://basescan.org/address/0x8e8d7bb8ad939caba20dca419a633ceb9263f36f). Full source:
+[`incrementer.base.eth`](https://www.base.org/name/incrementer) is a live counter contract. Anyone can increment it, only the owner can manage its basename. Full source:
 
 ```solidity
 // SPDX-License-Identifier: MIT
@@ -152,6 +155,8 @@ contract Counter is BasenameRegistrar {
 }
 ```
 
+Deployed at [`0x2287ECB162bC14d69f336541cEEfFf738f57d676`](https://basescan.org/address/0x2287ecb162bc14d69f336541ceefff738f57d676).
+
 ---
 
 ## Mainnet contract addresses
@@ -185,7 +190,7 @@ constructor() BasenameRegistrar(
 | Name squatted pre-deploy | Front-running on deployment tx | Register in constructor, or use CREATE2 to predict your address first |
 
 **Why can't a random person set a primary name for your contract?**
-The ReverseRegistrar only accepts `setName` when `msg.sender == the address being named`. Nobody external can call `setName` on behalf of your contract — only your contract itself can do it. The attack vector is solely through an unprotected public wrapper you expose.
+The ReverseRegistrar only accepts `setName` when `msg.sender == the address being named`. Nobody external can call this on behalf of your contract — only your contract itself can. The attack vector is solely through an unprotected public wrapper you expose.
 
 ---
 
