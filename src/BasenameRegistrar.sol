@@ -47,6 +47,11 @@ abstract contract BasenameRegistrar {
     /// @notice Emitted when the forward addr record is set on the resolver.
     event ForwardResolutionSet(string indexed name, address indexed contractAddress);
 
+    /// @notice Emitted when an excess ETH refund fails (e.g. caller is a contract
+    ///         with a reverting receive()). Registration already succeeded — the
+    ///         stranded ETH can be recovered via a rescue function in the inheritor.
+    event RefundFailed(address indexed recipient, uint256 amount);
+
     // =============================================================
     //                           ERRORS
     // =============================================================
@@ -54,6 +59,7 @@ abstract contract BasenameRegistrar {
     error InsufficientETH(uint256 required, uint256 provided);
     error InvalidDuration();
     error EmptyName();
+    error PartialAddressOverride();
 
     // =============================================================
     //                           CONSTANTS
@@ -93,17 +99,23 @@ abstract contract BasenameRegistrar {
     /**
      * @notice Pass (address(0), address(0), address(0)) for Base mainnet.
      *         Pass actual addresses to override for testnets.
+     * @dev All three addresses must be set together or all must be zero.
+     *      Passing a partial set (e.g. two addresses + address(0)) reverts to
+     *      prevent silent fallback to mainnet constants on testnet deployments.
      */
     constructor(
         address registrarController_,
         address reverseRegistrar_,
         address l2Resolver_
     ) {
-        if (
-            registrarController_ != address(0) &&
-            reverseRegistrar_ != address(0) &&
-            l2Resolver_ != address(0)
-        ) {
+        bool anySet = registrarController_ != address(0)
+                   || reverseRegistrar_   != address(0)
+                   || l2Resolver_         != address(0);
+        bool allSet = registrarController_ != address(0)
+                   && reverseRegistrar_   != address(0)
+                   && l2Resolver_         != address(0);
+        if (anySet && !allSet) revert PartialAddressOverride();
+        if (allSet) {
             _useCustomAddresses = true;
             _customRegistrarController = registrarController_;
             _customReverseRegistrar = reverseRegistrar_;
@@ -119,7 +131,26 @@ abstract contract BasenameRegistrar {
      * @notice Register a new basename and set the reverse (primary) name.
      * @dev Does NOT set forward resolution automatically — call _setForwardResolution
      *      immediately after to complete both directions. Refunds excess ETH.
-     * @param name     The label to register, e.g. "myapp" → myapp.base.eth
+     *
+     * @dev ⚠️ REENTRANCY: This function calls msg.sender (ETH refund) before returning.
+     *      Any public wrapper that updates state MUST use a nonReentrant modifier or
+     *      follow the checks-effects-interactions pattern.
+     *
+     * @dev ⚠️ REFUND FAILURE: If msg.sender is a smart contract whose receive() reverts,
+     *      the excess ETH refund will fail silently (registration still succeeds). A
+     *      RefundFailed event is emitted. Inheriting contracts SHOULD expose an
+     *      owner-callable ETH withdrawal function to recover any stranded refunds:
+     *
+     *          function rescueEth() external onlyOwner {
+     *              (bool ok, ) = msg.sender.call{value: address(this).balance}("");
+     *              require(ok, "ETH transfer failed");
+     *          }
+     *
+     * @dev ⚠️ PREMIUM DECAY: During premium decay periods, the price changes per block.
+     *      Send a 2–5% buffer above getBasenamePrice() to absorb price movement.
+     *      Excess is always refunded.
+     *
+     * @param name     The bare label to register, e.g. "myapp" → myapp.base.eth
      * @param duration Seconds to register for (minimum MIN_REGISTRATION_DURATION)
      */
     function _registerBasename(string memory name, uint256 duration) internal {
@@ -160,16 +191,21 @@ abstract contract BasenameRegistrar {
 
         controller.register{value: totalPrice}(request);
 
+        // Emit before refund to preserve CEI order and avoid reentrancy issues
+        // with off-chain monitors reading events mid-reentry.
+        emit BasenameRegistered(name, address(this), duration);
+
         // Refund only the excess from THIS call's msg.value — not the contract's
         // total balance, which may include funds held for other purposes.
         // excess = what was sent in - what the registrar charged
         uint256 excess = msg.value - totalPrice;
         if (excess > 0) {
             (bool ok, ) = msg.sender.call{value: excess}("");
-            ok; // non-reverting — registration already succeeded
+            // Non-reverting: registration already succeeded on-chain.
+            // If the caller's receive() reverts (e.g. multisig in restricted state),
+            // excess ETH is stranded in this contract. Emit event for off-chain recovery.
+            if (!ok) emit RefundFailed(msg.sender, excess);
         }
-
-        emit BasenameRegistered(name, address(this), duration);
     }
 
     /**
@@ -179,10 +215,19 @@ abstract contract BasenameRegistrar {
      *      the forward addr record is wrong or missing, call this to fix it.
      *      The contract must own the name (be the registry node owner) for this
      *      to be authorised by the resolver.
-     * @param name The label (e.g. "myapp" for myapp.base.eth)
+     *
+     * @dev Accepts ONLY the bare label (e.g. "myapp", not "myapp.base.eth").
+     *      Passing a full name like "myapp.base.eth" will set the wrong ENS node
+     *      (myapp.base.eth.base.eth) and silently break forward resolution.
+     *      Use _setPrimaryBasename if you need to accept both forms.
+     *
+     * @param name The bare label only (e.g. "myapp" for myapp.base.eth)
      */
     function _setForwardResolution(string memory name) internal {
         if (bytes(name).length == 0) revert EmptyName();
+        // Guard: reject full names like "myapp.base.eth" — passing those produces
+        // the wrong ENS node (myapp.base.eth.base.eth). Bare labels only.
+        if (_endsWithBaseEth(name)) revert EmptyName();
         bytes32 node = BasenameUtils.basenameNode(name);
         // setAddr(bytes32 node, address a) sets coinType 60 (ETH) addr record.
         // Authorised because address(this) is the registry owner of the node.

@@ -48,8 +48,17 @@ contract MyContract is BasenameRegistrar, Ownable {
     }
 
     /// @notice Step 2: Set the forward addr record (no ETH needed, separate tx).
+    /// @dev Pass the bare label only: "myapp", not "myapp.base.eth".
     function setForwardResolution(string memory name) external onlyOwner {
         _setForwardResolution(name);
+    }
+
+    /// @notice Recover any ETH stranded by a failed refund from registerBasename.
+    /// @dev If this contract's receive() ever reverts during a refund, overpaid ETH
+    ///      gets stuck here. This function lets the owner recover it.
+    function rescueEth() external onlyOwner {
+        (bool ok, ) = msg.sender.call{value: address(this).balance}("");
+        require(ok, "ETH transfer failed");
     }
 }
 ```
@@ -188,9 +197,51 @@ constructor() BasenameRegistrar(
 | ETH drained | Unprotected public `registerBasename` wrapper | Add `onlyOwner` or equivalent |
 | Primary name hijacked | Unprotected public `setForwardResolution` wrapper | Add `onlyOwner` or equivalent |
 | Name squatted pre-deploy | Front-running on deployment tx | Register in constructor, or use CREATE2 to predict your address first |
+| Excess ETH stranded | Caller's `receive()` reverts during refund | Add a `rescueEth` function (see below) |
 
 **Why can't a random person set a primary name for your contract?**
 The ReverseRegistrar only accepts `setName` when `msg.sender == the address being named`. Nobody external can call this on behalf of your contract — only your contract itself can. The attack vector is solely through an unprotected public wrapper you expose.
+
+### ⚠️ Add a `rescueEth` function to your inheriting contract
+
+If you call `registerBasename` from a smart contract whose `receive()` function can revert (e.g. a multisig, proxy, or any contract with conditional ETH acceptance), the excess ETH refund may fail silently. Registration still succeeds — the name is yours — but the overpaid ETH gets stranded in your contract with no way to recover it unless you add a withdrawal function.
+
+**Always add this to your inheriting contract:**
+
+```solidity
+/// @notice Recover any ETH stranded by a failed refund from _registerBasename.
+function rescueEth() external onlyOwner {
+    (bool ok, ) = msg.sender.call{value: address(this).balance}("");
+    require(ok, "ETH transfer failed");
+}
+```
+
+The abstract base will emit a `RefundFailed(address recipient, uint256 amount)` event if a refund fails, so you can detect it off-chain. But without a rescue function in your contract, you have no way to recover the ETH.
+
+### `_setForwardResolution` takes bare labels only
+
+Pass `"myapp"`, not `"myapp.base.eth"`. The function computes the ENS node from the bare label — if you pass a full name it will target the wrong node and break forward resolution. The contract now reverts if you pass a `.base.eth`-suffixed string.
+
+If you need to accept both forms, use `_setPrimaryBasename` which normalizes both.
+
+### Constructor: all-or-nothing address override
+
+When passing custom addresses (e.g. for testnet), you must provide all three or none. Passing two addresses and `address(0)` for the third now reverts with `PartialAddressOverride()` instead of silently falling back to mainnet constants.
+
+---
+
+## Security Audit
+
+This module was audited by [LeftClaw Services](https://leftclaw.services) on 2026-05-22.
+
+**Result: No critical, high, or medium findings.**
+
+3 low-severity findings were identified and addressed in this version:
+- **LOW-1** (RefundFailed event + CEI fix) — stranded ETH on failed refunds is now surfaced via `RefundFailed` event; emit moved before refund to restore CEI order
+- **LOW-2** (_setForwardResolution bare-label guard) — passing `"myapp.base.eth"` now reverts instead of silently setting the wrong ENS node
+- **LOW-3** (constructor partial-override guard) — partial address sets now revert instead of silently falling back to mainnet
+
+Full report: https://leftclaw.services/jobs/220
 
 ---
 
